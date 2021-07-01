@@ -27,7 +27,10 @@
 #include "dislocker/metadata/metadata_config.h"
 #include "dislocker/metadata/print_metadata.h"
 #include "dislocker/dislocker.priv.h"
-#include <sys/mount.h>
+
+#include <sys/ioctl.h>
+
+#define BLKSSZGET  _IO(0x12,104)/* get block device sector size */
 
 /*
  * On Darwin and FreeBSD, files are opened using 64 bits offsets/variables
@@ -451,8 +454,10 @@ static int check_volume_header(dis_metadata_t dis_meta, int volume_fd, off_t dis
 			        " failed\n", source);
 		}
 
-		dis_printf(L_ERROR, "EOW volume GUID not supported.\n");
-		return FALSE;
+		if (!dis_meta->cfg->readonly) {
+			dis_printf(L_ERROR, "EOW volume GUID not supported for writing.\n");
+			return FALSE;
+        }
 	}
 	else
 	{
@@ -826,7 +831,7 @@ static int get_eow_information(off_t source, void** eow_infos, int fd)
 		return FALSE;
 	}
 
-	size_t rest_size = size - sizeof(bitlocker_information_t);
+	size_t rest_size = size - sizeof(bitlocker_eow_infos_t);
 
 	*eow_infos = dis_malloc(size);
 
@@ -904,8 +909,13 @@ static int get_metadata_lazy_checked(
 		/* Get the metadata */
 		if(!get_metadata((off_t)regions[current].addr + disk_offset, metadata, fd))
 		{
+			/*
 			dis_printf(L_ERROR, "Can't get metadata (n°%d)\n", current+1);
 			return FALSE;
+			*/
+			if (++current >= 3)			//Consider metadata corruption
+				return FALSE;
+			continue;
 		}
 
 
@@ -936,8 +946,13 @@ static int get_metadata_lazy_checked(
 		ssize_t nb_read = dis_read(fd, &validations, sizeof(bitlocker_validations_t));
 		if(nb_read != sizeof(bitlocker_validations_t))
 		{
+			/*
 			dis_printf(L_ERROR, "Error, can't read all validations data.\n");
 			return FALSE;
+			*/
+			if (++current >= 3)		//Consider bad sectors
+				return FALSE;
+			continue;
 		}
 
 		/* Check the validity */
@@ -961,7 +976,7 @@ static int get_metadata_lazy_checked(
 			dis_free(*metadata);
 	}
 
-	if(current >= 3)
+	if(current > 3)
 		return FALSE;
 
 	return TRUE;
@@ -992,6 +1007,8 @@ static int get_eow_check_valid(
 	unsigned int  computed_crc32 = 0;
 	off_t         curr_offset = 0;
 	int           payload_size = 0;
+
+	unsigned char* crc_temp_buffer;
 
 	while(current < 2)
 	{
@@ -1030,7 +1047,12 @@ static int get_eow_check_valid(
 
 		/* Check the crc32 validity */
 		eow_infos_size = eow_infos_hdr->infos_size;
-		computed_crc32 = crc32((unsigned char*)*eow_infos, eow_infos_size);
+
+		crc_temp_buffer = (unsigned char*)dis_malloc(eow_infos_size);
+		memcpy(crc_temp_buffer, *eow_infos, eow_infos_size);
+		((bitlocker_eow_infos_t*)crc_temp_buffer)->crc32 = 0;
+		computed_crc32 = crc32(crc_temp_buffer, eow_infos_size);
+		dis_free(crc_temp_buffer);
 
 		dis_printf(L_DEBUG, "Looking if %#x == %#x for EOW information validation\n",
 		        computed_crc32, eow_infos_hdr->crc32);
@@ -1305,6 +1327,9 @@ uint32_t dis_metadata_backup_sectors_count(dis_metadata_t dis_meta)
 	return dis_meta->information->nb_backup_sectors;
 }
 
+int dis_metadata_is_decrypted_state(dis_metadata_t dis_meta) {
+	return dis_meta->information->curr_state == METADATA_STATE_DECRYPTED;
+}
 
 #ifdef _HAVE_RUBY
 #include <sys/types.h>
